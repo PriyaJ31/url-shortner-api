@@ -98,22 +98,6 @@ GET http://127.0.0.1:5000/stats/Ab3xYz
 
 ---
 
-## 🚀 Deploy on Render or Railway
-
-### 🔸 Render
-1. Push repo to GitHub  
-2. Go to [Render.com](https://render.com) → “New Web Service”  
-3. Select repo →  
-   - **Build Command:** `pip install -r requirements.txt`  
-   - **Start Command:** `python main.py`
-
-### 🔸 Railway
-1. Import GitHub repo  
-2. Add environment variables  
-3. Deploy with 1 click 🚀
-
----
-
 ## 🧾 Example Commit
 ```bash
 git add .
