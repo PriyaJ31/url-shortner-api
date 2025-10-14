@@ -1,13 +1,16 @@
-from flask import Blueprint, request, jsonify, redirect
+from flask import Blueprint, request, jsonify, redirect, render_template_string
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime
 from urllib.parse import urlparse
-from sqlalchemy.exc import IntegrityError
 import string, random
 
 from .models import db, URL
 
 bp = Blueprint("routes", __name__)
 
+# ----------------------
+# Helpers
+# ----------------------
 def _generate_short_id(k=6):
     alphabet = string.ascii_letters + string.digits
     return "".join(random.choices(alphabet, k=k))
@@ -19,6 +22,49 @@ def _is_valid_url(url: str) -> bool:
     except Exception:
         return False
 
+# ----------------------
+# Error handlers
+# ----------------------
+@bp.app_errorhandler(404)
+def handle_404(e):
+    if request.accept_mimetypes["application/json"] >= request.accept_mimetypes["text/html"]:
+        return jsonify(error="Not Found", path=request.path), 404
+    return "Not Found", 404
+
+@bp.app_errorhandler(400)
+def handle_400(e):
+    return jsonify(error="Bad Request", detail=str(e)), 400
+
+# ----------------------
+# Home page (simple form)
+# ----------------------
+@bp.route("/", methods=["GET"])
+def home():
+    return render_template_string("""
+    <html>
+    <head>
+        <title>URL Shortener</title>
+        <style>
+            body { font-family: Arial, sans-serif; text-align: center; margin-top: 100px; }
+            input[type=url] { width: 360px; padding: 10px; }
+            button { padding: 10px 20px; margin-left: 8px; }
+            .msg { margin-top: 16px; color: #666; }
+        </style>
+    </head>
+    <body>
+        <h2>🔗 URL Shortener</h2>
+        <form method="POST" action="/shorten">
+            <input type="url" name="url" placeholder="https://example.com" required>
+            <button type="submit">Shorten</button>
+        </form>
+        <p class="msg">Use <code>POST /shorten</code> (JSON or form) to create a short link.</p>
+    </body>
+    </html>
+    """)
+
+# ----------------------
+# Create short URL
+# ----------------------
 @bp.route("/shorten", methods=["POST"])
 def shorten():
     data = request.get_json(silent=True) or request.form
@@ -29,10 +75,17 @@ def shorten():
     if not _is_valid_url(original_url):
         return jsonify({"error": "Invalid URL. Use http(s)://..."}), 400
 
-    # Optional: return existing entry for same original_url (not unique at DB level)
+    # Return existing mapping if present (duplicate handling)
     existing = URL.query.filter_by(original_url=original_url).first()
     if existing:
         short_url = request.host_url + existing.short_id
+        # Browser form UX: show clickable link
+        if not request.is_json:
+            return render_template_string(f"""
+            <p>✅ Already shortened:</p>
+            <p><a href="{short_url}">{short_url}</a></p>
+            <p><a href="/">Create another</a></p>
+            """), 200
         return jsonify({
             "message": "URL already shortened",
             "duplicate": True,
@@ -41,26 +94,52 @@ def shorten():
             "original_url": existing.original_url
         }), 200
 
-    # ensure unique short_id
+    # Generate unique short_id
     short_id = None
     for _ in range(7):
-        cand = _generate_short_id(6)  # <= 10 chars allowed by column
+        cand = _generate_short_id(6)  # fits within short_id length constraint
         if not URL.query.filter_by(short_id=cand).first():
             short_id = cand
             break
     if not short_id:
         return jsonify({"error": "Could not generate unique short id"}), 500
 
+    # Persist
     row = URL(original_url=original_url, short_id=short_id)
     db.session.add(row)
     try:
         db.session.commit()
     except IntegrityError:
         db.session.rollback()
-        return jsonify({"error": "Collision on short id, try again"}), 500
+        # Extremely rare: collision or concurrent insert
+        existing = URL.query.filter_by(original_url=original_url).first()
+        if existing:
+            short_url = request.host_url + existing.short_id
+            if not request.is_json:
+                return render_template_string(f"""
+                <p>✅ Already shortened:</p>
+                <p><a href="{short_url}">{short_url}</a></p>
+                <p><a href="/">Create another</a></p>
+                """), 200
+            return jsonify({
+                "message": "URL already shortened",
+                "duplicate": True,
+                "short_id": existing.short_id,
+                "short_url": short_url,
+                "original_url": existing.original_url
+            }), 200
+        return jsonify({"error": "DB error. Please retry."}), 500
 
     short_url = request.host_url + short_id
-    print(f"[INFO] Short URL created: {short_url} -> {original_url}")  # console print for local test
+    print(f"[INFO] Short URL created: {short_url} -> {original_url}")  # console log for local testing
+
+    # If submitted from the browser form, show a small success page
+    if not request.is_json:
+        return render_template_string(f"""
+        <p>✅ Short URL created:</p>
+        <p><a href="{short_url}">{short_url}</a></p>
+        <p><a href="/">Create another</a></p>
+        """), 201
 
     return jsonify({
         "short_id": short_id,
@@ -68,17 +147,81 @@ def shorten():
         "original_url": original_url
     }), 201
 
+# ----------------------
+# Redirect by short_id (+analytics)
+# ----------------------
 @bp.route("/<string:short_id>", methods=["GET"])
 def redirect_short(short_id):
     row = URL.query.filter_by(short_id=short_id).first()
     if not row:
         return jsonify({"error": "Not found"}), 404
 
-    row.click_count += 1
-    db.session.commit()
+    # Update analytics
+    try:
+        row.click_count = (row.click_count or 0) + 1
+        # Only set last_accessed if the column exists in your model
+        if hasattr(row, "last_accessed"):
+            row.last_accessed = datetime.utcnow()
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        # don't block redirect on analytics error
     return redirect(row.original_url, code=302)
 
+# ----------------------
+# List all entries
+# ----------------------
 @bp.route("/all", methods=["GET"])
 def list_all():
     rows = URL.query.order_by(URL.id.desc()).all()
-    return jsonify([r.to_dict() for r in rows])
+    payload = []
+    for r in rows:
+        item = {
+            "id": r.id,
+            "original_url": r.original_url,
+            "short_id": r.short_id,
+            "click_count": r.click_count,
+            "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+        }
+        if hasattr(r, "last_accessed") and r.last_accessed:
+            item["last_accessed"] = r.last_accessed.isoformat() + "Z"
+        payload.append(item)
+    return jsonify(payload), 200
+
+# ----------------------
+# Quick stats for one entry (useful in tests)
+# ----------------------
+@bp.route("/stats/<string:short_id>", methods=["GET"])
+def stats(short_id):
+    r = URL.query.filter_by(short_id=short_id).first()
+    if not r:
+        return jsonify({"error": "Not found"}), 404
+    item = {
+        "id": r.id,
+        "original_url": r.original_url,
+        "short_id": r.short_id,
+        "click_count": r.click_count,
+        "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+    }
+    if hasattr(r, "last_accessed") and r.last_accessed:
+        item["last_accessed"] = r.last_accessed.isoformat() + "Z"
+    return jsonify(item), 200
+
+# ----------------------
+# Analytics summary (sorted by clicks desc)
+# ----------------------
+@bp.route("/analytics", methods=["GET"])
+def analytics():
+    rows = URL.query.order_by(URL.click_count.desc(), URL.id.desc()).all()
+    payload = []
+    for r in rows:
+        item = {
+            "short_id": r.short_id,
+            "original_url": r.original_url,
+            "click_count": r.click_count,
+            "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+        }
+        if hasattr(r, "last_accessed") and r.last_accessed:
+            item["last_accessed"] = r.last_accessed.isoformat() + "Z"
+        payload.append(item)
+    return jsonify(payload), 200

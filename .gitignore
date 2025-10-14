@@ -1,2 +1,14 @@
-/README_Public.md
-/urls.db
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local env
+.env
+
+# SQLite DB files
+*.db
+*.sqlite
+*.sqlite3
+database.db
+urls.db
