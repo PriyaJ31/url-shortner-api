@@ -2,7 +2,8 @@ from flask import Blueprint, request, jsonify, redirect, render_template, render
 from sqlalchemy.exc import IntegrityError
 from datetime import datetime
 from urllib.parse import urlparse
-import string, random
+import string
+import random
 
 from .models import db, URL
 from .extensions import limiter  # rate limiter singleton
