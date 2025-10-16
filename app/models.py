@@ -1,7 +1,6 @@
+# app/models.py
 from datetime import datetime
-from flask_sqlalchemy import SQLAlchemy
-
-db = SQLAlchemy()
+from .extensions import db  # <-- import shared db
 
 class URL(db.Model):
     __tablename__ = "urls"

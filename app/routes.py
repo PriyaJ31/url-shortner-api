@@ -5,17 +5,29 @@ from urllib.parse import urlparse
 import string, random
 
 from .models import db, URL
+from .extensions import limiter  # rate limiter singleton
 
 bp = Blueprint("routes", __name__)
 
 # ----------------------
 # Helpers
 # ----------------------
+def error_response(message: str, status: int = 400, hint: str | None = None):
+    payload = {"error": message}
+    if hint:
+        payload["hint"] = hint
+    return jsonify(payload), status
+
 def _generate_short_id(k=6):
     alphabet = string.ascii_letters + string.digits
     return "".join(random.choices(alphabet, k=k))
 
 def _is_valid_url(url: str) -> bool:
+    """Strict-ish check without extra deps: require http(s), netloc, no spaces."""
+    if not url or not isinstance(url, str) or url.strip() == "":
+        return False
+    if " " in url:
+        return False
     try:
         p = urlparse(url)
         return p.scheme in ("http", "https") and bool(p.netloc)
@@ -23,22 +35,20 @@ def _is_valid_url(url: str) -> bool:
         return False
 
 # ----------------------
-# Error handlers
+# Error handlers (JSON shape unified)
 # ----------------------
 @bp.app_errorhandler(404)
 def handle_404(e):
-    if request.accept_mimetypes["application/json"] >= request.accept_mimetypes["text/html"]:
-        return jsonify(error="Not Found", path=request.path), 404
-    return "Not Found", 404
+    return error_response("Not Found", 404, hint="Check the path or short_id.")
 
 @bp.app_errorhandler(400)
 def handle_400(e):
-    return jsonify(error="Bad Request", detail=str(e)), 400
+    return error_response("Bad Request", 400, hint=str(e))
 
 # ----------------------
 # Home page (simple form)
 # ----------------------
-@bp.route("/", methods=["GET"])
+@bp.route("/", methods=["GET"], endpoint="home_page")
 def home():
     return render_template_string("""
     <html>
@@ -57,23 +67,24 @@ def home():
             <input type="url" name="url" placeholder="https://example.com" required>
             <button type="submit">Shorten</button>
         </form>
-        <p class="msg">Use <code>POST /shorten</code> (JSON or form) to create a short link.</p>
+        <p class="msg">Use <code>POST /shorten</code> (JSON or form) to create a short link. View stats at <a href="/analytics">/analytics</a>.</p>
     </body>
     </html>
     """)
 
 # ----------------------
-# Create short URL
+# Create short URL (validation + consistent errors + rate limit)
 # ----------------------
-@bp.route("/shorten", methods=["POST"])
+@bp.route("/shorten", methods=["POST"], endpoint="shorten_url")
+@limiter.limit("5 per minute")   # 5 req/min per client IP
 def shorten():
     data = request.get_json(silent=True) or request.form
     original_url = (data.get("url") or data.get("original_url") or "").strip()
 
     if not original_url:
-        return jsonify({"error": "Missing 'url'"}), 400
+        return error_response("Missing 'url'", 400, hint='Send JSON: {"url": "https://..."}')
     if not _is_valid_url(original_url):
-        return jsonify({"error": "Invalid URL. Use http(s)://..."}), 400
+        return error_response("Invalid URL", 400, hint="Use http(s):// and a valid host.")
 
     # Return existing mapping if present (duplicate handling)
     existing = URL.query.filter_by(original_url=original_url).first()
@@ -97,12 +108,12 @@ def shorten():
     # Generate unique short_id
     short_id = None
     for _ in range(7):
-        cand = _generate_short_id(6)  # fits within short_id length constraint
+        cand = _generate_short_id(6)
         if not URL.query.filter_by(short_id=cand).first():
             short_id = cand
             break
     if not short_id:
-        return jsonify({"error": "Could not generate unique short id"}), 500
+        return error_response("Could not generate unique short id", 500)
 
     # Persist
     row = URL(original_url=original_url, short_id=short_id)
@@ -115,12 +126,6 @@ def shorten():
         existing = URL.query.filter_by(original_url=original_url).first()
         if existing:
             short_url = request.host_url + existing.short_id
-            if not request.is_json:
-                return render_template_string(f"""
-                <p>✅ Already shortened:</p>
-                <p><a href="{short_url}">{short_url}</a></p>
-                <p><a href="/">Create another</a></p>
-                """), 200
             return jsonify({
                 "message": "URL already shortened",
                 "duplicate": True,
@@ -128,7 +133,7 @@ def shorten():
                 "short_url": short_url,
                 "original_url": existing.original_url
             }), 200
-        return jsonify({"error": "DB error. Please retry."}), 500
+        return error_response("Database error", 500, hint="Please retry.")
 
     short_url = request.host_url + short_id
     print(f"[INFO] Short URL created: {short_url} -> {original_url}")  # console log for local testing
@@ -150,28 +155,26 @@ def shorten():
 # ----------------------
 # Redirect by short_id (+analytics)
 # ----------------------
-@bp.route("/<string:short_id>", methods=["GET"])
+@bp.route("/<string:short_id>", methods=["GET"], endpoint="redirect_short")
 def redirect_short(short_id):
     row = URL.query.filter_by(short_id=short_id).first()
     if not row:
-        return jsonify({"error": "Not found"}), 404
+        return error_response("Not Found", 404, hint="Unknown short_id.")
 
     # Update analytics
     try:
         row.click_count = (row.click_count or 0) + 1
-        # Only set last_accessed if the column exists in your model
         if hasattr(row, "last_accessed"):
             row.last_accessed = datetime.utcnow()
         db.session.commit()
     except Exception:
-        db.session.rollback()
-        # don't block redirect on analytics error
+        db.session.rollback()  # don't block redirect on analytics error
     return redirect(row.original_url, code=302)
 
 # ----------------------
-# List all entries
+# List all entries (JSON)
 # ----------------------
-@bp.route("/all", methods=["GET"])
+@bp.route("/all", methods=["GET"], endpoint="list_all_urls")
 def list_all():
     rows = URL.query.order_by(URL.id.desc()).all()
     payload = []
@@ -189,13 +192,13 @@ def list_all():
     return jsonify(payload), 200
 
 # ----------------------
-# Quick stats for one entry (useful in tests)
+# Quick stats for one entry (JSON)
 # ----------------------
-@bp.route("/stats/<string:short_id>", methods=["GET"])
+@bp.route("/stats/<string:short_id>", methods=["GET"], endpoint="stats_one")
 def stats(short_id):
     r = URL.query.filter_by(short_id=short_id).first()
     if not r:
-        return jsonify({"error": "Not found"}), 404
+        return error_response("Not Found", 404, hint="Unknown short_id.")
     item = {
         "id": r.id,
         "original_url": r.original_url,
@@ -208,7 +211,7 @@ def stats(short_id):
     return jsonify(item), 200
 
 # ----------------------
-# Analytics UI (HTML)  /analytics
+# Analytics UI (HTML)
 # ----------------------
 @bp.route("/analytics", methods=["GET"], endpoint="analytics_page")
 def analytics_page():
@@ -236,7 +239,7 @@ def analytics_page():
     )
 
 # ----------------------
-# Analytics JSON        /api/analytics
+# Analytics JSON (programmatic)
 # ----------------------
 @bp.route("/api/analytics", methods=["GET"], endpoint="analytics_json")
 def analytics_json():
