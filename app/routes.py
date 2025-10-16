@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify, redirect, render_template_string
+from flask import Blueprint, request, jsonify, redirect, render_template, render_template_string
 from sqlalchemy.exc import IntegrityError
 from datetime import datetime
 from urllib.parse import urlparse
@@ -208,11 +208,46 @@ def stats(short_id):
     return jsonify(item), 200
 
 # ----------------------
-# Analytics summary (sorted by clicks desc)
+# Analytics UI (HTML)  /analytics
 # ----------------------
-@bp.route("/analytics", methods=["GET"])
-def analytics():
-    rows = URL.query.order_by(URL.click_count.desc(), URL.id.desc()).all()
+@bp.route("/analytics", methods=["GET"], endpoint="analytics_page")
+def analytics_page():
+    q = (request.args.get("q") or "").strip()
+    query = URL.query
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            (URL.original_url.ilike(like)) | (URL.short_id.ilike(like))
+        )
+
+    rows = query.order_by(URL.click_count.desc(), URL.id.desc()).all()
+
+    # top 10 for chart
+    top = rows[:10]
+    labels = [r.short_id for r in top]
+    clicks = [r.click_count for r in top]
+
+    return render_template(
+        "analytics.html",
+        rows=rows,
+        q=q,
+        labels=labels,
+        clicks=clicks,
+    )
+
+# ----------------------
+# Analytics JSON        /api/analytics
+# ----------------------
+@bp.route("/api/analytics", methods=["GET"], endpoint="analytics_json")
+def analytics_json():
+    q = (request.args.get("q") or "").strip()
+    query = URL.query
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            (URL.original_url.ilike(like)) | (URL.short_id.ilike(like))
+        )
+    rows = query.order_by(URL.click_count.desc(), URL.id.desc()).all()
     payload = []
     for r in rows:
         item = {
